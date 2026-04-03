@@ -2,12 +2,60 @@ import UIKit
 import MetalKit
 import SpecttyTerminal
 
+private final class TerminalTextPosition: UITextPosition {
+    let offset: Int
+
+    init(offset: Int) {
+        self.offset = offset
+    }
+}
+
+private final class TerminalTextRange: UITextRange {
+    let startPosition: TerminalTextPosition
+    let endPosition: TerminalTextPosition
+
+    init(start: Int, end: Int) {
+        self.startPosition = TerminalTextPosition(offset: start)
+        self.endPosition = TerminalTextPosition(offset: end)
+    }
+
+    override var start: UITextPosition { startPosition }
+    override var end: UITextPosition { endPosition }
+    override var isEmpty: Bool { startPosition.offset == endPosition.offset }
+}
+
+private final class TerminalIMETextField: UITextField {
+    var accessoryProvider: (() -> UIView?)?
+    var emptyDeleteHandler: (() -> Void)?
+
+    override var inputAccessoryView: UIView? {
+        get { accessoryProvider?() }
+        set {}
+    }
+
+    override func deleteBackward() {
+        let hasMarkedText = markedTextRange != nil
+        let hasBufferedText = !(text?.isEmpty ?? true)
+        super.deleteBackward()
+
+        if !hasMarkedText && !hasBufferedText {
+            emptyDeleteHandler?()
+        }
+    }
+}
+
 /// MTKView subclass that renders the terminal using Metal.
-/// Conforms to UIKeyInput so iOS presents the software keyboard.
-public final class TerminalMetalView: MTKView, UIKeyInput {
+/// Conforms to UITextInput so iOS IMEs can use marked-text composition.
+public final class TerminalMetalView: MTKView, UITextInput {
     private var renderer: TerminalMetalRenderer?
     private weak var terminalEmulator: (any TerminalEmulator)?
     private var scrollOffset: Int = 0
+    private let imeTextField = TerminalIMETextField(frame: .zero)
+    private var markedTextStorage: String = ""
+    private var markedSelection: NSRange = NSRange(location: 0, length: 0)
+    private var textInputMarkedTextStyle: [NSAttributedString.Key: Any]?
+    private weak var textInputDelegateRef: UITextInputDelegate?
+    private lazy var textInputTokenizer = UITextInputStringTokenizer(textInput: self)
     private let feedbackGenerator = UIImpactFeedbackGenerator(style: .light)
     private lazy var _inputAccessory: TerminalInputAccessory = {
         let bar = TerminalInputAccessory(frame: CGRect(x: 0, y: 0, width: bounds.width, height: 44))
@@ -81,6 +129,27 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
         self.delegate = self
         self.isMultipleTouchEnabled = true
         self.isUserInteractionEnabled = true
+
+        imeTextField.autocorrectionType = .no
+        imeTextField.autocapitalizationType = .none
+        imeTextField.smartQuotesType = .no
+        imeTextField.smartDashesType = .no
+        imeTextField.smartInsertDeleteType = .no
+        imeTextField.spellCheckingType = .no
+        imeTextField.keyboardType = .default
+        imeTextField.returnKeyType = .default
+        imeTextField.delegate = self
+        imeTextField.tintColor = .clear
+        imeTextField.textColor = .clear
+        imeTextField.backgroundColor = .clear
+        imeTextField.accessoryProvider = { [weak self] in self?._inputAccessory }
+        imeTextField.emptyDeleteHandler = { [weak self] in
+            self?.sendDeleteBackwardToTerminal()
+        }
+        imeTextField.addTarget(self, action: #selector(handleIMETextChanged), for: .editingChanged)
+        imeTextField.frame = CGRect(x: -1000, y: -1000, width: 1, height: 1)
+        imeTextField.alpha = 0.01
+        addSubview(imeTextField)
 
         // Selection overlay — hit tests only near drag handles, passes through otherwise.
         selectionView.frame = bounds
@@ -189,18 +258,44 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
 
     public override var inputAccessoryView: UIView? { _inputAccessory }
 
+    @discardableResult
+    public override func becomeFirstResponder() -> Bool {
+        imeTextField.becomeFirstResponder()
+    }
+
+    @discardableResult
+    public override func resignFirstResponder() -> Bool {
+        imeTextField.resignFirstResponder()
+    }
+
+    public override var isFirstResponder: Bool {
+        imeTextField.isFirstResponder
+    }
+
     /// UIKeyInput: tells iOS we always accept text (keeps keyboard open).
     public var hasText: Bool { true }
 
-    /// UIKeyInput: software keyboard character input.
-    public func insertText(_ text: String) {
+    private func resetMarkedText() {
+        guard !markedTextStorage.isEmpty else { return }
+        inputDelegate?.selectionWillChange(self)
+        inputDelegate?.textWillChange(self)
+        markedTextStorage = ""
+        markedSelection = NSRange(location: 0, length: 0)
+        inputDelegate?.textDidChange(self)
+        inputDelegate?.selectionDidChange(self)
+    }
+
+    private func commitInputText(_ text: String) {
+        guard !text.isEmpty else { return }
+
         var modifiers = KeyModifiers()
         if _inputAccessory.ctrlActive { modifiers.insert(.control) }
         if _inputAccessory.shiftActive { modifiers.insert(.shift) }
         let hasModifiers = !modifiers.isEmpty
 
-        // QuickPath/swipe often commits whole words at once.
-        // Send plain text as a single key event to preserve order.
+        // QuickPath/swipe and IME commit may submit multi-character text at
+        // once. Preserve that as a single payload when no control mapping is
+        // needed.
         if !modifiers.contains(.control), !text.contains("\n") {
             let event = KeyEvent(
                 keyCode: 0,
@@ -222,7 +317,6 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
                 characters = "\r"
             } else if modifiers.contains(.control), let ascii = char.asciiValue,
                       (0x61...0x7A).contains(ascii) || (0x41...0x5A).contains(ascii) {
-                // Ctrl+letter → control character (e.g., Ctrl+C = 0x03)
                 let upper = ascii & 0x1F
                 characters = String(UnicodeScalar(upper))
             } else {
@@ -243,8 +337,7 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
         }
     }
 
-    /// UIKeyInput: software keyboard backspace.
-    public func deleteBackward() {
+    private func sendDeleteBackwardToTerminal() {
         var modifiers = KeyModifiers()
         if _inputAccessory.ctrlActive { modifiers.insert(.control) }
         if _inputAccessory.shiftActive { modifiers.insert(.shift) }
@@ -261,6 +354,45 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
         if hasModifiers {
             _inputAccessory.deactivateModifiers()
         }
+    }
+
+    @objc private func handleIMETextChanged() {
+        guard imeTextField.markedTextRange == nil else { return }
+        guard let text = imeTextField.text, !text.isEmpty else { return }
+        commitInputText(text)
+        imeTextField.text = ""
+    }
+
+    /// UIKeyInput: software keyboard character input.
+    public func insertText(_ text: String) {
+        resetMarkedText()
+        commitInputText(text)
+    }
+
+    /// UIKeyInput: software keyboard backspace.
+    public func deleteBackward() {
+        if !markedTextStorage.isEmpty {
+            inputDelegate?.selectionWillChange(self)
+            inputDelegate?.textWillChange(self)
+
+            if markedSelection.length > 0 {
+                let start = markedSelection.location
+                let end = start + markedSelection.length
+                let startIndex = markedTextStorage.index(markedTextStorage.startIndex, offsetBy: start)
+                let endIndex = markedTextStorage.index(markedTextStorage.startIndex, offsetBy: end)
+                markedTextStorage.removeSubrange(startIndex..<endIndex)
+                markedSelection = NSRange(location: start, length: 0)
+            } else if markedSelection.location > 0 {
+                let deleteIndex = markedTextStorage.index(markedTextStorage.startIndex, offsetBy: markedSelection.location - 1)
+                markedTextStorage.remove(at: deleteIndex)
+                markedSelection = NSRange(location: markedSelection.location - 1, length: 0)
+            }
+
+            inputDelegate?.textDidChange(self)
+            inputDelegate?.selectionDidChange(self)
+            return
+        }
+        sendDeleteBackwardToTerminal()
     }
 
     /// Disable autocorrect/autocapitalize — raw terminal input.
@@ -295,8 +427,177 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
     }
 
     public var keyboardType: UIKeyboardType {
-        get { .asciiCapable }
+        get { .default }
         set {}
+    }
+
+    public var selectedTextRange: UITextRange? {
+        get {
+            let end = markedSelection.location + markedSelection.length
+            return TerminalTextRange(start: markedSelection.location, end: end)
+        }
+        set {
+            guard let range = newValue as? TerminalTextRange else { return }
+            let start = max(0, min(range.startPosition.offset, markedTextStorage.count))
+            let end = max(start, min(range.endPosition.offset, markedTextStorage.count))
+            markedSelection = NSRange(location: start, length: end - start)
+        }
+    }
+
+    public var markedTextRange: UITextRange? {
+        guard !markedTextStorage.isEmpty else { return nil }
+        return TerminalTextRange(start: 0, end: markedTextStorage.count)
+    }
+
+    public var markedTextStyle: [NSAttributedString.Key: Any]? {
+        get { textInputMarkedTextStyle }
+        set { textInputMarkedTextStyle = newValue }
+    }
+
+    public var beginningOfDocument: UITextPosition { TerminalTextPosition(offset: 0) }
+
+    public var endOfDocument: UITextPosition { TerminalTextPosition(offset: markedTextStorage.count) }
+
+    public var inputDelegate: UITextInputDelegate? {
+        get { textInputDelegateRef }
+        set { textInputDelegateRef = newValue }
+    }
+
+    public var tokenizer: UITextInputTokenizer { textInputTokenizer }
+
+    public func text(in range: UITextRange) -> String? {
+        guard let range = range as? TerminalTextRange else { return nil }
+        let start = max(0, min(range.startPosition.offset, markedTextStorage.count))
+        let end = max(start, min(range.endPosition.offset, markedTextStorage.count))
+        let startIndex = markedTextStorage.index(markedTextStorage.startIndex, offsetBy: start)
+        let endIndex = markedTextStorage.index(markedTextStorage.startIndex, offsetBy: end)
+        return String(markedTextStorage[startIndex..<endIndex])
+    }
+
+    public func replace(_ range: UITextRange, withText text: String) {
+        guard let range = range as? TerminalTextRange else { return }
+        let start = max(0, min(range.startPosition.offset, markedTextStorage.count))
+        let end = max(start, min(range.endPosition.offset, markedTextStorage.count))
+        let startIndex = markedTextStorage.index(markedTextStorage.startIndex, offsetBy: start)
+        let endIndex = markedTextStorage.index(markedTextStorage.startIndex, offsetBy: end)
+        let replacesMarkedText = !markedTextStorage.isEmpty
+
+        if replacesMarkedText {
+            inputDelegate?.selectionWillChange(self)
+            inputDelegate?.textWillChange(self)
+        }
+
+        markedTextStorage.replaceSubrange(startIndex..<endIndex, with: text)
+        let caret = start + text.count
+        markedSelection = NSRange(location: caret, length: 0)
+
+        if replacesMarkedText {
+            inputDelegate?.textDidChange(self)
+            inputDelegate?.selectionDidChange(self)
+            commitInputText(markedTextStorage)
+            resetMarkedText()
+        } else {
+            commitInputText(text)
+        }
+    }
+
+    public func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        inputDelegate?.selectionWillChange(self)
+        inputDelegate?.textWillChange(self)
+        markedTextStorage = markedText ?? ""
+        let location = max(0, min(selectedRange.location, markedTextStorage.count))
+        let length = max(0, min(selectedRange.length, markedTextStorage.count - location))
+        markedSelection = NSRange(location: location, length: length)
+        inputDelegate?.textDidChange(self)
+        inputDelegate?.selectionDidChange(self)
+    }
+
+    public func unmarkText() {
+        resetMarkedText()
+    }
+
+    public func textRange(from fromPosition: UITextPosition, to toPosition: UITextPosition) -> UITextRange? {
+        guard let from = fromPosition as? TerminalTextPosition,
+              let to = toPosition as? TerminalTextPosition else { return nil }
+        return TerminalTextRange(start: min(from.offset, to.offset), end: max(from.offset, to.offset))
+    }
+
+    public func position(from position: UITextPosition, offset: Int) -> UITextPosition? {
+        guard let position = position as? TerminalTextPosition else { return nil }
+        let next = position.offset + offset
+        guard next >= 0, next <= markedTextStorage.count else { return nil }
+        return TerminalTextPosition(offset: next)
+    }
+
+    public func position(from position: UITextPosition, in direction: UITextLayoutDirection, offset: Int) -> UITextPosition? {
+        self.position(from: position, offset: offset)
+    }
+
+    public func compare(_ position: UITextPosition, to other: UITextPosition) -> ComparisonResult {
+        guard let lhs = position as? TerminalTextPosition,
+              let rhs = other as? TerminalTextPosition else { return .orderedSame }
+        if lhs.offset < rhs.offset { return .orderedAscending }
+        if lhs.offset > rhs.offset { return .orderedDescending }
+        return .orderedSame
+    }
+
+    public func offset(from: UITextPosition, to toPosition: UITextPosition) -> Int {
+        guard let from = from as? TerminalTextPosition,
+              let to = toPosition as? TerminalTextPosition else { return 0 }
+        return to.offset - from.offset
+    }
+
+    public func position(within range: UITextRange, farthestIn direction: UITextLayoutDirection) -> UITextPosition? {
+        guard let range = range as? TerminalTextRange else { return nil }
+        switch direction {
+        case .left, .up:
+            return range.start
+        case .right, .down:
+            return range.end
+        @unknown default:
+            return range.end
+        }
+    }
+
+    public func characterRange(byExtending position: UITextPosition, in direction: UITextLayoutDirection) -> UITextRange? {
+        guard let position = position as? TerminalTextPosition else { return nil }
+        let offset = position.offset
+        switch direction {
+        case .left, .up:
+            guard offset > 0 else { return nil }
+            return TerminalTextRange(start: offset - 1, end: offset)
+        case .right, .down:
+            guard offset < markedTextStorage.count else { return nil }
+            return TerminalTextRange(start: offset, end: offset + 1)
+        @unknown default:
+            return nil
+        }
+    }
+
+    public func baseWritingDirection(for position: UITextPosition, in direction: UITextStorageDirection) -> NSWritingDirection {
+        .natural
+    }
+
+    public func setBaseWritingDirection(_ writingDirection: NSWritingDirection, for range: UITextRange) {}
+
+    public func firstRect(for range: UITextRange) -> CGRect { .zero }
+
+    public func caretRect(for position: UITextPosition) -> CGRect { .zero }
+
+    public func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
+
+    public func closestPosition(to point: CGPoint) -> UITextPosition? {
+        TerminalTextPosition(offset: markedTextStorage.count)
+    }
+
+    public func closestPosition(to point: CGPoint, within range: UITextRange) -> UITextPosition? {
+        guard let range = range as? TerminalTextRange else { return nil }
+        return range.end
+    }
+
+    public func characterRange(at point: CGPoint) -> UITextRange? {
+        guard !markedTextStorage.isEmpty else { return nil }
+        return TerminalTextRange(start: 0, end: markedTextStorage.count)
     }
 
     // MARK: - External Keyboard Shortcuts
@@ -473,7 +774,20 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
         let (columns, rows) = gridSize
         // Don't send resize for views that haven't been laid out yet.
         guard columns > 1, rows > 1 else { return }
-        // Don't send duplicate resizes.
+
+        // Keep the local emulator aligned with the current view grid
+        // immediately. The remote PTY resize can stay debounced, but the
+        // visible terminal should not spend a frame interpreting content with
+        // stale dimensions.
+        if let emulator = terminalEmulator,
+           emulator.state.columns != columns || emulator.state.rows != rows {
+            emulator.resize(columns: columns, rows: rows)
+            scrollOffset = 0
+            selectionView.selection = nil
+            setNeedsDisplay()
+        }
+
+        // Don't send duplicate resizes upstream.
         guard columns != lastReportedGridSize.columns || rows != lastReportedGridSize.rows else { return }
 
         // Debounce: keyboard animations trigger many intermediate layouts.
@@ -564,5 +878,16 @@ extension TerminalMetalView: MTKViewDelegate {
             contentRect: terminalContentRect
         )
         renderer.render(to: renderPassDescriptor, drawable: drawable)
+    }
+}
+
+extension TerminalMetalView: UITextFieldDelegate {
+    public func textField(_ textField: UITextField, shouldChangeCharactersIn range: NSRange, replacementString string: String) -> Bool {
+        if string == "\n" || string == "\r" {
+            commitInputText("\n")
+            textField.text = ""
+            return false
+        }
+        return true
     }
 }
