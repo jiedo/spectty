@@ -94,10 +94,6 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
         addInteraction(interaction)
         self.editMenuInteraction = interaction
 
-        // Tap to focus and show keyboard.
-        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
-        addGestureRecognizer(tap)
-
         // Pause Metal rendering while backgrounded — drawables are unavailable
         // and attempting to render produces blank frames.
         NotificationCenter.default.addObserver(
@@ -122,17 +118,14 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
         isPaused = false
     }
 
-    @objc private func handleTap() {
-        // Clear any active selection on tap.
+    private func handleLocalTap() {
+        // Clear any active selection on tap before focusing the terminal.
         if selectionView.selection != nil {
             selectionView.selection = nil
             editMenuInteraction?.dismissMenu()
-            return
         }
 
-        if isFirstResponder {
-            resignFirstResponder()
-        } else {
+        if !isFirstResponder {
             becomeFirstResponder()
         }
     }
@@ -164,6 +157,9 @@ public final class TerminalMetalView: MTKView, UIKeyInput {
         }
         handler.onEdgeSwipe = { [weak self] event in
             self?.onEdgeSwipe?(event)
+        }
+        handler.onLocalTap = { [weak self] in
+            self?.handleLocalTap()
         }
         // Handle-drag updates from the selection overlay.
         selectionView.onSelectionChanged = { [weak self, weak handler] selection in
