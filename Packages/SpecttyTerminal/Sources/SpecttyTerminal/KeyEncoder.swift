@@ -18,27 +18,6 @@ public struct KeyEncoder: Sendable {
             return Data("\u{1B}[Z".utf8)
         }
 
-        // If the key has printable characters and no special modifiers beyond shift,
-        // just send the characters.
-        if !event.characters.isEmpty && event.modifiers.subtracting(.shift).isEmpty {
-            // Check if it's a special key first.
-            if let special = encodeSpecialKey(event.keyCode, applicationCursor: applicationCursor) {
-                return Data(special.utf8)
-            }
-
-            // Control key combinations.
-            if event.modifiers.contains(.control) {
-                return encodeControl(event.characters)
-            }
-
-            return Data(event.characters.utf8)
-        }
-
-        // Handle control key.
-        if event.modifiers.contains(.control) && !event.characters.isEmpty {
-            return encodeControl(event.characters)
-        }
-
         // Handle special keys (arrows, function keys, etc.).
         if let special = encodeSpecialKey(event.keyCode, applicationCursor: applicationCursor) {
             if event.modifiers.isEmpty {
@@ -48,9 +27,22 @@ public struct KeyEncoder: Sendable {
             return encodeModifiedSpecial(special, modifiers: event.modifiers)
         }
 
-        // Fallback: send characters if we have them.
         if !event.characters.isEmpty {
-            return Data(event.characters.utf8)
+            let data: Data
+
+            // Alt acts as Meta for printable keys: prefix ESC and send the
+            // unmodified printable bytes after control handling if present.
+            if event.modifiers.contains(.control) {
+                data = encodeControl(event.characters)
+            } else {
+                data = Data(event.characters.utf8)
+            }
+
+            if event.modifiers.contains(.alt) {
+                return Data([0x1B]) + data
+            }
+
+            return data
         }
 
         return Data()

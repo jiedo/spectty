@@ -47,6 +47,12 @@ private final class TerminalIMETextField: UITextField {
 /// MTKView subclass that renders the terminal using Metal.
 /// Conforms to UITextInput so iOS IMEs can use marked-text composition.
 public final class TerminalMetalView: MTKView, UITextInput {
+    private struct HardwareSequenceBinding {
+        let keyCode: UIKeyboardHIDUsage
+        let modifiers: UIKeyModifierFlags
+        let sequence: String
+    }
+
     private var renderer: TerminalMetalRenderer?
     private weak var terminalEmulator: (any TerminalEmulator)?
     private var scrollOffset: Int = 0
@@ -104,6 +110,50 @@ public final class TerminalMetalView: MTKView, UITextInput {
     /// Visual bell flash layer.
     private var bellLayer: CALayer?
     private var currentTheme: TerminalTheme = .default
+    private static let commandSequenceBindings: [HardwareSequenceBinding] = [
+        HardwareSequenceBinding(
+            keyCode: .keyboardR,
+            modifiers: .command,
+            sequence: "\u{1B}[3~,"
+        ),
+        HardwareSequenceBinding(
+            keyCode: .keyboardZ,
+            modifiers: .command,
+            sequence: "\u{1B}[3~p"
+        ),
+        HardwareSequenceBinding(
+            keyCode: .keyboardX,
+            modifiers: .command,
+            sequence: "\u{1B}[3~n"
+        ),
+        HardwareSequenceBinding(
+            keyCode: .keyboardC,
+            modifiers: .command,
+            sequence: "\u{1B}[3~c"
+        ),
+    ]
+    private static let keypadSequenceBindings: [HardwareSequenceBinding] = [
+        HardwareSequenceBinding(
+            keyCode: .keypad1,
+            modifiers: [],
+            sequence: "\u{1B}[3~p"
+        ),
+        HardwareSequenceBinding(
+            keyCode: .keypad2,
+            modifiers: [],
+            sequence: "\u{1B}[3~n"
+        ),
+        HardwareSequenceBinding(
+            keyCode: .keypad3,
+            modifiers: [],
+            sequence: "\u{1B}[3~c"
+        ),
+        HardwareSequenceBinding(
+            keyCode: .keypad0,
+            modifiers: [],
+            sequence: "\u{1B}[3~s"
+        ),
+    ]
 
     public init(frame: CGRect, emulator: any TerminalEmulator) {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -733,10 +783,30 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     public override var keyCommands: [UIKeyCommand]? {
         [
-            UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(handlePaste)),
-            UIKeyCommand(input: "k", modifierFlags: .command, action: #selector(handleClearScreen)),
-            UIKeyCommand(input: "c", modifierFlags: .command, action: #selector(handleCopy)),
+            UIKeyCommand(input: "r", modifierFlags: .command, action: #selector(handleRenameTmuxWindow)),
+            UIKeyCommand(input: "z", modifierFlags: .command, action: #selector(handlePreviousTmuxWindow)),
+            UIKeyCommand(input: "x", modifierFlags: .command, action: #selector(handleNextTmuxWindow)),
+            UIKeyCommand(input: "c", modifierFlags: .command, action: #selector(handleCreateTmuxWindow)),
+            UIKeyCommand(input: "v", modifierFlags: [.command, .shift], action: #selector(handlePaste)),
+            UIKeyCommand(input: "k", modifierFlags: [.command, .shift], action: #selector(handleClearScreen)),
+            UIKeyCommand(input: "c", modifierFlags: [.command, .shift], action: #selector(handleCopy)),
         ]
+    }
+
+    @objc private func handleRenameTmuxWindow() {
+        sendHardwareSequence("\u{1B}[3~,")
+    }
+
+    @objc private func handlePreviousTmuxWindow() {
+        sendHardwareSequence("\u{1B}[3~p")
+    }
+
+    @objc private func handleNextTmuxWindow() {
+        sendHardwareSequence("\u{1B}[3~n")
+    }
+
+    @objc private func handleCreateTmuxWindow() {
+        sendHardwareSequence("\u{1B}[3~c")
     }
 
     @objc private func handlePaste() {
@@ -757,6 +827,16 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     @objc private func handleCopy() {
         copyScreenText()
+    }
+
+    private func sendHardwareSequence(_ sequence: String) {
+        let event = KeyEvent(
+            keyCode: 0,
+            modifiers: [],
+            isKeyDown: true,
+            characters: sequence
+        )
+        onKeyInput?(event)
     }
 
     private func copyScreenText() {
@@ -963,6 +1043,11 @@ public final class TerminalMetalView: MTKView, UITextInput {
                 continue
             }
 
+            if let sequence = customHardwareSequence(for: key) {
+                sendHardwareSequence(sequence)
+                continue
+            }
+
             if shouldRouteHardwareKeyToTerminal(key) {
                 terminalPresses.insert(press)
             } else {
@@ -980,7 +1065,7 @@ public final class TerminalMetalView: MTKView, UITextInput {
                 keyCode: UInt32(key.keyCode.rawValue),
                 modifiers: modifiersFromUIKey(key),
                 isKeyDown: true,
-                characters: key.characters ?? ""
+                characters: terminalCharacters(for: key)
             )
             onKeyInput?(keyEvent)
         }
@@ -993,6 +1078,10 @@ public final class TerminalMetalView: MTKView, UITextInput {
         for press in presses {
             guard let key = press.key else {
                 systemPresses.insert(press)
+                continue
+            }
+
+            if customHardwareSequence(for: key) != nil {
                 continue
             }
 
@@ -1013,13 +1102,17 @@ public final class TerminalMetalView: MTKView, UITextInput {
                 keyCode: UInt32(key.keyCode.rawValue),
                 modifiers: modifiersFromUIKey(key),
                 isKeyDown: false,
-                characters: key.characters ?? ""
+                characters: terminalCharacters(for: key)
             )
             onKeyInput?(keyEvent)
         }
     }
 
     private func shouldRouteHardwareKeyToTerminal(_ key: UIKey) -> Bool {
+        if customHardwareSequence(for: key) != nil {
+            return true
+        }
+
         if shouldAllowSystemInputMethodShortcut(key) {
             return false
         }
@@ -1060,6 +1153,39 @@ public final class TerminalMetalView: MTKView, UITextInput {
         }
 
         return true
+    }
+
+    private func customHardwareSequence(for key: UIKey) -> String? {
+        let modifiers = normalizedHardwareModifiers(key.modifierFlags)
+        let binding = (Self.commandSequenceBindings + Self.keypadSequenceBindings).first {
+            $0.keyCode == key.keyCode && $0.modifiers == modifiers
+        }
+        return binding?.sequence
+    }
+
+    private func terminalCharacters(for key: UIKey) -> String {
+        let modifiers = normalizedHardwareModifiers(key.modifierFlags)
+        let rawCharacters = key.characters ?? ""
+
+        guard modifiers.intersection([.alternate, .control, .command]).isEmpty == false else {
+            return rawCharacters
+        }
+
+        let base = key.charactersIgnoringModifiers
+        guard !base.isEmpty else { return rawCharacters }
+
+        if modifiers.contains(.shift),
+           base.count == 1,
+           let scalar = base.unicodeScalars.first,
+           CharacterSet.letters.contains(scalar) {
+            return base.uppercased()
+        }
+
+        return base
+    }
+
+    private func normalizedHardwareModifiers(_ modifiers: UIKeyModifierFlags) -> UIKeyModifierFlags {
+        modifiers.intersection([.shift, .alternate, .control, .command])
     }
 
     private func shouldAllowSystemReturnHandling(_ key: UIKey) -> Bool {
