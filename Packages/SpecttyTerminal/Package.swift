@@ -18,5 +18,9 @@ let package = Package(
             name: "SpecttyTerminal",
             dependencies: ["CGhosttyVT"]
         ),
+        .testTarget(
+            name: "SpecttyTerminalTests",
+            dependencies: ["SpecttyTerminal"]
+        ),
     ]
 )
