@@ -96,12 +96,14 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     /// Text selection overlay.
     private let selectionView = TextSelectionView()
+    private let preeditLabel = UILabel()
 
     /// Edit menu interaction (replaces deprecated UIMenuController).
     private var editMenuInteraction: UIEditMenuInteraction?
 
     /// Visual bell flash layer.
     private var bellLayer: CALayer?
+    private var currentTheme: TerminalTheme = .default
 
     public init(frame: CGRect, emulator: any TerminalEmulator) {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -147,9 +149,15 @@ public final class TerminalMetalView: MTKView, UITextInput {
             self?.sendDeleteBackwardToTerminal()
         }
         imeTextField.addTarget(self, action: #selector(handleIMETextChanged), for: .editingChanged)
-        imeTextField.frame = CGRect(x: -1000, y: -1000, width: 1, height: 1)
+        imeTextField.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
         imeTextField.alpha = 0.01
         addSubview(imeTextField)
+
+        preeditLabel.isHidden = true
+        preeditLabel.backgroundColor = .clear
+        preeditLabel.numberOfLines = 1
+        preeditLabel.isUserInteractionEnabled = false
+        addSubview(preeditLabel)
 
         // Selection overlay — hit tests only near drag handles, passes through otherwise.
         selectionView.frame = bounds
@@ -260,7 +268,8 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     @discardableResult
     public override func becomeFirstResponder() -> Bool {
-        imeTextField.becomeFirstResponder()
+        updateIMETextFieldFrame()
+        return imeTextField.becomeFirstResponder()
     }
 
     @discardableResult
@@ -283,6 +292,8 @@ public final class TerminalMetalView: MTKView, UITextInput {
         markedSelection = NSRange(location: 0, length: 0)
         inputDelegate?.textDidChange(self)
         inputDelegate?.selectionDidChange(self)
+        updateIMETextFieldFrame()
+        updatePreeditOverlay()
     }
 
     private func commitInputText(_ text: String) {
@@ -356,11 +367,31 @@ public final class TerminalMetalView: MTKView, UITextInput {
         }
     }
 
+    private var hasActiveIMEComposition: Bool {
+        if imeTextField.markedTextRange != nil { return true }
+        return !activePreeditText.isEmpty
+    }
+
+    private func clearIMECompositionState() {
+        imeTextField.text = ""
+        resetMarkedText()
+        updateIMETextFieldFrame()
+        updatePreeditOverlay()
+    }
+
+    private func cancelIMEComposition() {
+        guard hasActiveIMEComposition else { return }
+        imeTextField.text = ""
+        imeTextField.unmarkText()
+        clearIMECompositionState()
+    }
+
     @objc private func handleIMETextChanged() {
+        updatePreeditOverlay()
         guard imeTextField.markedTextRange == nil else { return }
         guard let text = imeTextField.text, !text.isEmpty else { return }
         commitInputText(text)
-        imeTextField.text = ""
+        clearIMECompositionState()
     }
 
     /// UIKeyInput: software keyboard character input.
@@ -510,6 +541,8 @@ public final class TerminalMetalView: MTKView, UITextInput {
         markedSelection = NSRange(location: location, length: length)
         inputDelegate?.textDidChange(self)
         inputDelegate?.selectionDidChange(self)
+        updateIMETextFieldFrame()
+        updatePreeditOverlay()
     }
 
     public func unmarkText() {
@@ -580,9 +613,105 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     public func setBaseWritingDirection(_ writingDirection: NSWritingDirection, for range: UITextRange) {}
 
-    public func firstRect(for range: UITextRange) -> CGRect { .zero }
+    private func rectForMarkedText(offset: Int = 0, width: Int = 1) -> CGRect {
+        guard let emulator = terminalEmulator else { return .zero }
 
-    public func caretRect(for position: UITextPosition) -> CGRect { .zero }
+        let screen = emulator.state.activeScreen
+        let row = max(0, min(screen.cursor.row, max(0, screen.rows - 1)))
+        let col = max(0, min(screen.cursor.col + offset, max(0, screen.columns - 1)))
+        let visibleWidth = max(1, width)
+        let contentRect = terminalContentRect.isEmpty ? bounds : terminalContentRect
+
+        return CGRect(
+            x: contentRect.minX + CGFloat(col) * cellSize.width,
+            y: contentRect.minY + CGFloat(row) * cellSize.height,
+            width: max(cellSize.width, CGFloat(visibleWidth) * cellSize.width),
+            height: max(cellSize.height, 1)
+        )
+    }
+
+    private func updateIMETextFieldFrame() {
+        let targetRect: CGRect
+        let preeditText = activePreeditText
+        if !preeditText.isEmpty {
+            let width = max(1, preeditText.count)
+            targetRect = rectForMarkedText(offset: 0, width: width)
+        } else {
+            targetRect = rectForMarkedText()
+        }
+
+        let frame = targetRect.isEmpty
+            ? CGRect(x: 0, y: 0, width: 1, height: 1)
+            : CGRect(
+                x: targetRect.minX,
+                y: targetRect.minY,
+                width: max(1, targetRect.width),
+                height: max(1, targetRect.height)
+            )
+
+        if imeTextField.frame != frame {
+            imeTextField.frame = frame
+        }
+    }
+
+    private var activePreeditText: String {
+        if let text = imeTextField.text, !text.isEmpty, imeTextField.markedTextRange != nil {
+            return text
+        }
+        return markedTextStorage
+    }
+
+    private func updatePreeditOverlay() {
+        let preeditText = activePreeditText
+        guard !preeditText.isEmpty else {
+            preeditLabel.isHidden = true
+            preeditLabel.attributedText = nil
+            renderer?.setCursorSuppressed(false)
+            setNeedsDisplay()
+            return
+        }
+
+        let font = UIFont(name: terminalFont.name, size: terminalFont.size)
+            ?? UIFont.monospacedSystemFont(ofSize: terminalFont.size, weight: .regular)
+        let fg = UIColor(
+            red: CGFloat(currentTheme.foreground.0) / 255.0,
+            green: CGFloat(currentTheme.foreground.1) / 255.0,
+            blue: CGFloat(currentTheme.foreground.2) / 255.0,
+            alpha: 1.0
+        )
+
+        preeditLabel.attributedText = NSAttributedString(
+            string: preeditText,
+            attributes: [
+                .font: font,
+                .foregroundColor: fg,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ]
+        )
+        preeditLabel.sizeToFit()
+
+        let anchorRect = rectForMarkedText(offset: 0, width: max(1, preeditText.count))
+        preeditLabel.frame = CGRect(
+            x: anchorRect.minX,
+            y: anchorRect.minY + max(0, (anchorRect.height - preeditLabel.bounds.height) / 2.0),
+            width: max(anchorRect.width, preeditLabel.bounds.width),
+            height: max(anchorRect.height, preeditLabel.bounds.height)
+        )
+        preeditLabel.isHidden = false
+        renderer?.setCursorSuppressed(true)
+        setNeedsDisplay()
+    }
+
+    public func firstRect(for range: UITextRange) -> CGRect {
+        guard let range = range as? TerminalTextRange else { return rectForMarkedText() }
+        let width = max(1, range.endPosition.offset - range.startPosition.offset)
+        return rectForMarkedText(offset: range.startPosition.offset, width: width)
+    }
+
+    public func caretRect(for position: UITextPosition) -> CGRect {
+        guard let position = position as? TerminalTextPosition else { return rectForMarkedText() }
+        return rectForMarkedText(offset: position.offset)
+    }
 
     public func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
 
@@ -693,10 +822,12 @@ public final class TerminalMetalView: MTKView, UITextInput {
         guard font.name != terminalFont.name || font.size != terminalFont.size else { return }
         self.terminalFont = font
         renderer?.setFont(font)
+        updatePreeditOverlay()
         notifyResizeIfNeeded()
     }
 
     public func setTheme(_ theme: TerminalTheme) {
+        currentTheme = theme
         renderer?.setTheme(theme)
         // Update the clear color to match the theme background.
         self.clearColor = MTLClearColor(
@@ -705,6 +836,7 @@ public final class TerminalMetalView: MTKView, UITextInput {
             blue: Double(theme.background.2) / 255.0,
             alpha: 1.0
         )
+        updatePreeditOverlay()
     }
 
     public func setCursorStyle(_ style: CursorStyle) {
@@ -814,13 +946,35 @@ public final class TerminalMetalView: MTKView, UITextInput {
         selectionView.contentInsets = terminalContentInsets
         selectionView.cellSize = cellSize
         bellLayer?.frame = bounds
+        updateIMETextFieldFrame()
+        updatePreeditOverlay()
         notifyResizeIfNeeded()
     }
 
     // MARK: - Hardware Key Input (external keyboards)
 
     public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var terminalPresses = Set<UIPress>()
+        var systemPresses = Set<UIPress>()
+
         for press in presses {
+            guard let key = press.key else {
+                systemPresses.insert(press)
+                continue
+            }
+
+            if shouldRouteHardwareKeyToTerminal(key) {
+                terminalPresses.insert(press)
+            } else {
+                systemPresses.insert(press)
+            }
+        }
+
+        if !systemPresses.isEmpty {
+            super.pressesBegan(systemPresses, with: event)
+        }
+
+        for press in terminalPresses {
             guard let key = press.key else { continue }
             let keyEvent = KeyEvent(
                 keyCode: UInt32(key.keyCode.rawValue),
@@ -833,7 +987,27 @@ public final class TerminalMetalView: MTKView, UITextInput {
     }
 
     public override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var terminalPresses = Set<UIPress>()
+        var systemPresses = Set<UIPress>()
+
         for press in presses {
+            guard let key = press.key else {
+                systemPresses.insert(press)
+                continue
+            }
+
+            if shouldRouteHardwareKeyToTerminal(key) {
+                terminalPresses.insert(press)
+            } else {
+                systemPresses.insert(press)
+            }
+        }
+
+        if !systemPresses.isEmpty {
+            super.pressesEnded(systemPresses, with: event)
+        }
+
+        for press in terminalPresses {
             guard let key = press.key else { continue }
             let keyEvent = KeyEvent(
                 keyCode: UInt32(key.keyCode.rawValue),
@@ -842,6 +1016,108 @@ public final class TerminalMetalView: MTKView, UITextInput {
                 characters: key.characters ?? ""
             )
             onKeyInput?(keyEvent)
+        }
+    }
+
+    private func shouldRouteHardwareKeyToTerminal(_ key: UIKey) -> Bool {
+        if shouldAllowSystemInputMethodShortcut(key) {
+            return false
+        }
+
+        if shouldCancelCompositionOnEscape(key) {
+            cancelIMEComposition()
+            return false
+        }
+
+        if shouldAllowSystemReturnHandling(key) {
+            return false
+        }
+
+        if shouldAllowSystemDeleteHandling(key) {
+            return false
+        }
+
+        if isTerminalSpecialKey(key.keyCode) {
+            return true
+        }
+
+        let modifiers = key.modifierFlags.intersection([.shift, .alternate, .control, .command, .alphaShift])
+
+        if modifiers.contains(.command) || modifiers.contains(.alternate) || modifiers.contains(.control) {
+            return true
+        }
+
+        let charactersIgnoringModifiers = key.charactersIgnoringModifiers
+        if modifiers.isSubset(of: [.shift, .alphaShift]),
+           !charactersIgnoringModifiers.isEmpty {
+            return false
+        }
+
+        let characters = key.characters
+        if !characters.isEmpty,
+           characters.rangeOfCharacter(from: .controlCharacters) == nil {
+            return false
+        }
+
+        return true
+    }
+
+    private func shouldAllowSystemReturnHandling(_ key: UIKey) -> Bool {
+        guard key.keyCode == .keyboardReturnOrEnter else { return false }
+        return hasActiveIMEComposition
+    }
+
+    private func shouldCancelCompositionOnEscape(_ key: UIKey) -> Bool {
+        guard key.keyCode == .keyboardEscape else { return false }
+        return hasActiveIMEComposition
+    }
+
+    private func shouldAllowSystemDeleteHandling(_ key: UIKey) -> Bool {
+        guard key.keyCode == .keyboardDeleteOrBackspace else { return false }
+        return hasActiveIMEComposition
+    }
+
+    private func shouldAllowSystemInputMethodShortcut(_ key: UIKey) -> Bool {
+        let modifiers = key.modifierFlags.intersection([.shift, .control, .alternate, .command, .alphaShift])
+        guard modifiers == [.control] || modifiers == [.control, .shift] else { return false }
+
+        let candidates = [key.charactersIgnoringModifiers, key.characters]
+        return candidates.contains { value in
+            return value == " "
+        }
+    }
+
+    private func isTerminalSpecialKey(_ keyCode: UIKeyboardHIDUsage) -> Bool {
+        switch keyCode {
+        case .keyboardUpArrow,
+             .keyboardDownArrow,
+             .keyboardLeftArrow,
+             .keyboardRightArrow,
+             .keyboardHome,
+             .keyboardEnd,
+             .keyboardPageUp,
+             .keyboardPageDown,
+             .keyboardInsert,
+             .keyboardDeleteForward,
+             .keyboardDeleteOrBackspace,
+             .keyboardReturnOrEnter,
+             .keyboardEscape,
+             .keyboardTab,
+             .keyboardF1,
+             .keyboardF2,
+             .keyboardF3,
+             .keyboardF4,
+             .keyboardF5,
+             .keyboardF6,
+             .keyboardF7,
+             .keyboardF8,
+             .keyboardF9,
+             .keyboardF10,
+             .keyboardF11,
+             .keyboardF12:
+            return true
+        default:
+            return false
         }
     }
 
@@ -884,6 +1160,13 @@ extension TerminalMetalView: MTKViewDelegate {
 extension TerminalMetalView: UITextFieldDelegate {
     public func textField(_ textField: UITextField, shouldChangeCharactersIn range: NSRange, replacementString string: String) -> Bool {
         if string == "\n" || string == "\r" {
+            if hasActiveIMEComposition {
+                if let committedText = imeTextField.text, !committedText.isEmpty {
+                    commitInputText(committedText)
+                }
+                clearIMECompositionState()
+                return false
+            }
             commitInputText("\n")
             textField.text = ""
             return false

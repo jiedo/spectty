@@ -26,6 +26,7 @@ public protocol TerminalRenderer: AnyObject {
         contentRect: CGRect
     )
     func setFont(_ font: TerminalFont)
+    func setCursorSuppressed(_ suppressed: Bool)
     var cellSize: CGSize { get }
 }
 
@@ -103,6 +104,7 @@ public final class TerminalMetalRenderer: TerminalRenderer {
     private var defaultBG: (UInt8, UInt8, UInt8) { theme.background }
     private var cursorColor: (UInt8, UInt8, UInt8) { theme.cursor }
     private var _cursorStyle: CursorStyle = .block
+    private var isCursorSuppressed = false
 
     public init(device: MTLDevice, scaleFactor: CGFloat) {
         self.device = device
@@ -154,6 +156,10 @@ public final class TerminalMetalRenderer: TerminalRenderer {
 
     public func setCursorStyle(_ style: CursorStyle) {
         self._cursorStyle = style
+    }
+
+    public func setCursorSuppressed(_ suppressed: Bool) {
+        isCursorSuppressed = suppressed
     }
 
     // MARK: - Color Resolution
@@ -505,7 +511,7 @@ public final class TerminalMetalRenderer: TerminalRenderer {
         }
 
         // Cursor rendering.
-        if scrollOffset == 0 && state.cursor.visible {
+        if scrollOffset == 0 && state.cursor.visible && !isCursorSuppressed {
             let cursorRow = state.cursor.row
             var cursorCol = state.cursor.col
             if cursorRow >= 0 && cursorRow < state.rows && cursorCol >= 0 && cursorCol < state.columns {
