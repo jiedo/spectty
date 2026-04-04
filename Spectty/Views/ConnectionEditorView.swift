@@ -8,6 +8,7 @@ struct ConnectionEditorView: View {
     let onSave: (ServerConnection) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var showMoshAdvanced = false
+    @State private var portText: String = ""
 
     @State private var keyValidationError: String?
     @State private var derivedPublicKey: String?
@@ -26,10 +27,14 @@ struct ConnectionEditorView: View {
                     HStack {
                         Text("Port")
                         Spacer()
-                        TextField("22", value: $connection.port, format: .number)
+                        TextField("22", text: $portText)
                             .keyboardType(.numberPad)
+                            .textInputAutocapitalization(.never)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 80)
+                            .onChange(of: portText) {
+                                sanitizePortText()
+                            }
                     }
                 }
 
@@ -195,6 +200,9 @@ struct ConnectionEditorView: View {
                 }
             }
             .onAppear {
+                if portText.isEmpty {
+                    portText = String(connection.port)
+                }
                 loadExistingKey()
             }
         }
@@ -202,6 +210,7 @@ struct ConnectionEditorView: View {
 
     private var isSaveEnabled: Bool {
         guard !connection.host.isEmpty, !connection.username.isEmpty else { return false }
+        guard isValidPortText else { return false }
         if connection.authMethod == .publicKey {
             // Allow save if a key is already in Keychain or a new valid key was pasted.
             return hasExistingKey || (!connection.privateKeyPEM.isEmpty && keyValidationError == nil && derivedPublicKey != nil)
@@ -235,6 +244,22 @@ struct ConnectionEditorView: View {
             get: { connection.moshPreset },
             set: { connection.applyMoshPreset($0) }
         )
+    }
+
+    private var isValidPortText: Bool {
+        guard let port = Int(portText), (1...65_535).contains(port) else { return false }
+        return true
+    }
+
+    private func sanitizePortText() {
+        let digitsOnly = portText.filter(\.isNumber)
+        if digitsOnly != portText {
+            portText = digitsOnly
+            return
+        }
+
+        guard let port = Int(digitsOnly), (1...65_535).contains(port) else { return }
+        connection.port = port
     }
 
     private func validatePrivateKey() {
