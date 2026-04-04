@@ -1,5 +1,6 @@
 import UIKit
 import MetalKit
+import GameController
 import SpecttyTerminal
 
 private final class TerminalTextPosition: UITextPosition {
@@ -72,6 +73,7 @@ public final class TerminalMetalView: MTKView, UITextInput {
         }
         return bar
     }()
+    private var hardwareKeyboardConnected = GCKeyboard.coalesced != nil
 
     /// Callback for when the view is resized and a new grid size is computed.
     public var onResize: ((Int, Int) -> Void)?
@@ -194,7 +196,9 @@ public final class TerminalMetalView: MTKView, UITextInput {
         imeTextField.tintColor = .clear
         imeTextField.textColor = .clear
         imeTextField.backgroundColor = .clear
-        imeTextField.accessoryProvider = { [weak self] in self?._inputAccessory }
+        imeTextField.accessoryProvider = { [weak self] in
+            self?.activeInputAccessoryView
+        }
         imeTextField.emptyDeleteHandler = { [weak self] in
             self?.sendDeleteBackwardToTerminal()
         }
@@ -235,6 +239,18 @@ public final class TerminalMetalView: MTKView, UITextInput {
             name: UIApplication.willEnterForegroundNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(hardwareKeyboardDidChange),
+            name: NSNotification.Name.GCKeyboardDidConnect,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(hardwareKeyboardDidChange),
+            name: NSNotification.Name.GCKeyboardDidDisconnect,
+            object: nil
+        )
     }
 
     @objc private func appDidEnterBackground() {
@@ -243,6 +259,7 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     @objc private func appWillEnterForeground() {
         isPaused = false
+        refreshHardwareKeyboardState()
     }
 
     private func handleLocalTap() {
@@ -314,7 +331,24 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     public override var canBecomeFirstResponder: Bool { true }
 
-    public override var inputAccessoryView: UIView? { _inputAccessory }
+    public override var inputAccessoryView: UIView? { activeInputAccessoryView }
+
+    private var activeInputAccessoryView: UIView? {
+        hardwareKeyboardConnected ? nil : _inputAccessory
+    }
+
+    @objc private func hardwareKeyboardDidChange() {
+        refreshHardwareKeyboardState()
+    }
+
+    private func refreshHardwareKeyboardState() {
+        let isConnected = GCKeyboard.coalesced != nil
+        guard hardwareKeyboardConnected != isConnected else { return }
+        hardwareKeyboardConnected = isConnected
+        imeTextField.reloadInputViews()
+        reloadInputViews()
+        setNeedsLayout()
+    }
 
     @discardableResult
     public override func becomeFirstResponder() -> Bool {
