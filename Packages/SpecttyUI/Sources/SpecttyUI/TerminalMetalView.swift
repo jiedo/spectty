@@ -2,6 +2,38 @@ import UIKit
 import MetalKit
 import SpecttyTerminal
 
+enum HardwareKeyInterpreter {
+    static func terminalCharacters(
+        rawCharacters: String,
+        charactersIgnoringModifiers: String,
+        modifiers: UIKeyModifierFlags
+    ) -> String {
+        let normalizedModifiers = modifiers.intersection([.shift, .alternate, .control, .command])
+
+        guard normalizedModifiers.intersection([.alternate, .control, .command]).isEmpty == false else {
+            return rawCharacters
+        }
+
+        // Prefer the post-layout printable character when modifiers still
+        // produce one, so combinations such as Alt+Shift+, preserve "<".
+        if !rawCharacters.isEmpty,
+           rawCharacters.rangeOfCharacter(from: .controlCharacters) == nil {
+            return rawCharacters
+        }
+
+        guard !charactersIgnoringModifiers.isEmpty else { return rawCharacters }
+
+        if normalizedModifiers.contains(.shift),
+           charactersIgnoringModifiers.count == 1,
+           let scalar = charactersIgnoringModifiers.unicodeScalars.first,
+           CharacterSet.letters.contains(scalar) {
+            return charactersIgnoringModifiers.uppercased()
+        }
+
+        return charactersIgnoringModifiers
+    }
+}
+
 private final class TerminalTextPosition: UITextPosition {
     let offset: Int
 
@@ -64,15 +96,20 @@ public final class TerminalMetalView: MTKView, UITextInput {
     private lazy var textInputTokenizer = UITextInputStringTokenizer(textInput: self)
     private let feedbackGenerator = UIImpactFeedbackGenerator(style: .light)
     private lazy var _inputAccessory: TerminalInputAccessory = {
-        let bar = TerminalInputAccessory(frame: CGRect(x: 0, y: 0, width: bounds.width, height: 44))
+        let bar = TerminalInputAccessory(frame: CGRect(x: 0, y: 0, width: bounds.width, height: 84))
         bar.autoresizingMask = .flexibleWidth
         bar.onKeyPress = { [weak self] event in
             self?.feedbackGenerator.impactOccurred()
             self?.onKeyInput?(event)
         }
+        bar.onKeyboardToggle = { [weak self] in
+            self?.toggleSoftwareKeyboard()
+        }
         return bar
     }()
     private var hardwareKeyboardConnected = false
+    private var softwareKeyboardPresented = false
+    private var softwareKeyboardFrameInView: CGRect = .null
     private var pendingDisplayWorkItem: DispatchWorkItem?
     private var lastDisplayTime: CFTimeInterval = 0
 
@@ -200,7 +237,7 @@ public final class TerminalMetalView: MTKView, UITextInput {
         imeTextField.textColor = .clear
         imeTextField.backgroundColor = .clear
         imeTextField.accessoryProvider = { [weak self] in
-            self?.activeInputAccessoryView
+            nil
         }
         imeTextField.emptyDeleteHandler = { [weak self] in
             self?.sendDeleteBackwardToTerminal()
@@ -221,6 +258,8 @@ public final class TerminalMetalView: MTKView, UITextInput {
         selectionView.contentInsets = terminalContentInsets
         selectionView.cellSize = cellSize
         addSubview(selectionView)
+        addSubview(_inputAccessory)
+        updateKeyboardToggleControls()
 
         // Edit menu interaction for copy/paste — nil delegate uses default
         // behavior, building the menu from canPerformAction/copy/paste.
@@ -244,19 +283,19 @@ public final class TerminalMetalView: MTKView, UITextInput {
         )
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(hardwareKeyboardDidChange),
+            selector: #selector(handleKeyboardNotification(_:)),
             name: UIResponder.keyboardWillShowNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(hardwareKeyboardDidChange),
+            selector: #selector(handleKeyboardNotification(_:)),
             name: UIResponder.keyboardWillHideNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(hardwareKeyboardDidChange),
+            selector: #selector(handleKeyboardNotification(_:)),
             name: UIResponder.keyboardWillChangeFrameNotification,
             object: nil
         )
@@ -386,14 +425,11 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     public override var canBecomeFirstResponder: Bool { true }
 
-    public override var inputAccessoryView: UIView? { activeInputAccessoryView }
+    public override var inputAccessoryView: UIView? { nil }
 
-    private var activeInputAccessoryView: UIView? {
-        hardwareKeyboardConnected ? nil : _inputAccessory
-    }
-
-    @objc private func hardwareKeyboardDidChange() {
+    @objc private func handleKeyboardNotification(_ notification: Notification) {
         refreshHardwareKeyboardState()
+        updateSoftwareKeyboardPresentation(from: notification)
     }
 
     private var isHardwareKeyboardInputExpected: Bool {
@@ -402,8 +438,14 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     private func refreshHardwareKeyboardState(shouldReloadInputViews: Bool = true) {
         let isConnected = isHardwareKeyboardInputExpected
-        guard hardwareKeyboardConnected != isConnected else { return }
+        let didChange = hardwareKeyboardConnected != isConnected
         hardwareKeyboardConnected = isConnected
+        if hardwareKeyboardConnected {
+            softwareKeyboardPresented = false
+            softwareKeyboardFrameInView = .null
+        }
+        updateKeyboardToggleControls()
+        guard didChange else { return }
         guard shouldReloadInputViews else { return }
         imeTextField.reloadInputViews()
         reloadInputViews()
@@ -414,12 +456,21 @@ public final class TerminalMetalView: MTKView, UITextInput {
     public override func becomeFirstResponder() -> Bool {
         refreshHardwareKeyboardState()
         updateIMETextFieldFrame()
-        return imeTextField.becomeFirstResponder()
+        let becameFirstResponder = imeTextField.becomeFirstResponder()
+        if becameFirstResponder, !hardwareKeyboardConnected {
+            softwareKeyboardPresented = true
+        }
+        updateKeyboardToggleControls()
+        return becameFirstResponder
     }
 
     @discardableResult
     public override func resignFirstResponder() -> Bool {
-        imeTextField.resignFirstResponder()
+        softwareKeyboardPresented = false
+        softwareKeyboardFrameInView = .null
+        let didResign = imeTextField.resignFirstResponder()
+        updateKeyboardToggleControls()
+        return didResign
     }
 
     public override var isFirstResponder: Bool {
@@ -934,6 +985,81 @@ public final class TerminalMetalView: MTKView, UITextInput {
         onKeyInput?(event)
     }
 
+    private func layoutPersistentInputAccessory() {
+        guard !_inputAccessory.isHidden else {
+            _inputAccessory.frame = .zero
+            return
+        }
+
+        let size = _inputAccessory.systemLayoutSizeFitting(
+            CGSize(width: bounds.width, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .defaultLow
+        )
+        let height = max(84, size.height)
+        let bottomAnchorY: CGFloat
+        if softwareKeyboardPresented,
+           softwareKeyboardFrameInView.isNull == false {
+            bottomAnchorY = min(bounds.maxY, softwareKeyboardFrameInView.minY)
+        } else {
+            bottomAnchorY = bounds.maxY - safeAreaInsets.bottom
+        }
+        _inputAccessory.frame = CGRect(
+            x: 0,
+            y: bottomAnchorY - height,
+            width: bounds.width,
+            height: height
+        )
+    }
+
+    private func updateKeyboardToggleControls() {
+        let desiredHidden = hardwareKeyboardConnected
+        let visibilityChanged = _inputAccessory.isHidden != desiredHidden
+
+        _inputAccessory.softwareKeyboardVisible = softwareKeyboardPresented
+        _inputAccessory.isHidden = desiredHidden
+
+        if visibilityChanged {
+            setNeedsLayout()
+        }
+    }
+
+    private func updateSoftwareKeyboardPresentation(from notification: Notification) {
+        guard !hardwareKeyboardConnected else {
+            softwareKeyboardPresented = false
+            softwareKeyboardFrameInView = .null
+            updateKeyboardToggleControls()
+            return
+        }
+
+        if notification.name == UIResponder.keyboardWillHideNotification {
+            softwareKeyboardPresented = false
+            softwareKeyboardFrameInView = .null
+            updateKeyboardToggleControls()
+            layoutIfNeeded()
+            return
+        }
+
+        let endFrame = (notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect) ?? .zero
+        if let window {
+            softwareKeyboardFrameInView = convert(endFrame, from: window.screen.coordinateSpace)
+        } else {
+            softwareKeyboardFrameInView = .null
+        }
+        softwareKeyboardPresented = softwareKeyboardFrameInView.isNull == false
+            && softwareKeyboardFrameInView.minY < bounds.maxY
+        updateKeyboardToggleControls()
+        layoutIfNeeded()
+    }
+
+    private func toggleSoftwareKeyboard() {
+        if softwareKeyboardPresented || isFirstResponder {
+            resignFirstResponder()
+        } else {
+            becomeFirstResponder()
+        }
+    }
+
     private func copyScreenText() {
         guard let emulator = terminalEmulator else { return }
 
@@ -1044,9 +1170,23 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     /// Drawable content rect after applying terminal insets.
     var terminalContentRect: CGRect {
-        let rect = bounds.inset(by: terminalContentInsets)
+        var rect = bounds.inset(by: terminalContentInsets)
+        let reservedBottomHeight = persistentInputAccessoryReservedHeight
+        if reservedBottomHeight > 0 {
+            rect.size.height = max(0, rect.height - reservedBottomHeight)
+        }
         guard rect.width > 0, rect.height > 0 else { return .zero }
         return rect
+    }
+
+    private var persistentInputAccessoryReservedHeight: CGFloat {
+        guard !_inputAccessory.isHidden else { return 0 }
+
+        if !_inputAccessory.frame.isEmpty {
+            return max(0, bounds.maxY - _inputAccessory.frame.minY) + 4
+        }
+
+        return max(84, _inputAccessory.intrinsicContentSize.height) + safeAreaInsets.bottom + 4
     }
 
     public var gridSize: (columns: Int, rows: Int) {
@@ -1120,13 +1260,22 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     public override func layoutSubviews() {
         super.layoutSubviews()
+        refreshHardwareKeyboardState(shouldReloadInputViews: false)
         selectionView.frame = bounds
         selectionView.contentInsets = terminalContentInsets
         selectionView.cellSize = cellSize
         bellLayer?.frame = bounds
+        layoutPersistentInputAccessory()
         updateIMETextFieldFrame()
         updatePreeditOverlay()
         notifyResizeIfNeeded()
+    }
+
+    public override func didMoveToWindow() {
+        super.didMoveToWindow()
+        refreshHardwareKeyboardState(shouldReloadInputViews: false)
+        updateKeyboardToggleControls()
+        setNeedsLayout()
     }
 
     // MARK: - Hardware Key Input (external keyboards)

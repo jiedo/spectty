@@ -39,6 +39,23 @@ Useful entry points:
 - `TerminalView` is only the SwiftUI wrapper. Most rendering/input behavior
   is below it in UIKit/Metal code.
 
+## Input Bar / Keyboard Notes
+
+- The iOS terminal helper keys now live in a persistent bottom bar owned by
+  `TerminalMetalView`, not in `inputAccessoryView`.
+- That bar must stay visible when the software keyboard is manually hidden so
+  users can keep terminal control keys on screen while reclaiming space.
+- The bar must be hidden when iOS expects hardware keyboard input.
+- Current layout is two rows:
+  `Esc`, `Tab`, `Ctrl`, `Shift`, arrow keys, plus `Del` (forward delete),
+  `PgUp`, `PgDn`, and a software keyboard show/hide toggle.
+- The terminal content/grid sizing in `TerminalMetalView` reserves space for
+  this persistent bar, so future layout work should account for it before
+  changing bottom insets or keyboard overlap handling.
+- Main files for this behavior:
+  `Packages/SpecttyUI/Sources/SpecttyUI/TerminalInputAccessory.swift`
+  and `Packages/SpecttyUI/Sources/SpecttyUI/TerminalMetalView.swift`
+
 ## Power / Performance Context
 
 The biggest confirmed power issue in this repo was idle terminal rendering.
