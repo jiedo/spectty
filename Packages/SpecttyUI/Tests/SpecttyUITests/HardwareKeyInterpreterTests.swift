@@ -2,6 +2,16 @@ import XCTest
 @testable import SpecttyUI
 
 final class HardwareKeyInterpreterTests: XCTestCase {
+    func testAltLetterFallsBackToASCIIBaseCharacter() {
+        let value = HardwareKeyInterpreter.terminalCharacters(
+            rawCharacters: "ƒ",
+            charactersIgnoringModifiers: "f",
+            modifiers: [.alternate]
+        )
+
+        XCTAssertEqual(value, "f")
+    }
+
     func testAltShiftCommaPreservesShiftedSymbol() {
         let value = HardwareKeyInterpreter.terminalCharacters(
             rawCharacters: "<",
@@ -10,6 +20,16 @@ final class HardwareKeyInterpreterTests: XCTestCase {
         )
 
         XCTAssertEqual(value, "<")
+    }
+
+    func testAltShiftDigitUsesShiftedASCIISymbol() {
+        let value = HardwareKeyInterpreter.terminalCharacters(
+            rawCharacters: "¡",
+            charactersIgnoringModifiers: "1",
+            modifiers: [.alternate, .shift]
+        )
+
+        XCTAssertEqual(value, "!")
     }
 
     func testControlShiftSixPreservesCaretForControlMapping() {
