@@ -1250,24 +1250,11 @@ public final class TerminalMetalView: MTKView, UITextInput {
     }
 
     private func terminalCharacters(for key: UIKey) -> String {
-        let modifiers = normalizedHardwareModifiers(key.modifierFlags)
-        let rawCharacters = key.characters ?? ""
-
-        guard modifiers.intersection([.alternate, .control, .command]).isEmpty == false else {
-            return rawCharacters
-        }
-
-        let base = key.charactersIgnoringModifiers
-        guard !base.isEmpty else { return rawCharacters }
-
-        if modifiers.contains(.shift),
-           base.count == 1,
-           let scalar = base.unicodeScalars.first,
-           CharacterSet.letters.contains(scalar) {
-            return base.uppercased()
-        }
-
-        return base
+        HardwareKeyInterpreter.terminalCharacters(
+            rawCharacters: key.characters ?? "",
+            charactersIgnoringModifiers: key.charactersIgnoringModifiers,
+            modifiers: normalizedHardwareModifiers(key.modifierFlags)
+        )
     }
 
     private func normalizedHardwareModifiers(_ modifiers: UIKeyModifierFlags) -> UIKeyModifierFlags {

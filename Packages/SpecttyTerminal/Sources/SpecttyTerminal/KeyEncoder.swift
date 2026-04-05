@@ -20,6 +20,9 @@ public struct KeyEncoder: Sendable {
 
         // Handle special keys (arrows, function keys, etc.).
         if let special = encodeSpecialKey(event.keyCode, applicationCursor: applicationCursor) {
+            if let literal = encodeLiteralSpecialKey(special, modifiers: event.modifiers) {
+                return literal
+            }
             if event.modifiers.isEmpty {
                 return Data(special.utf8)
             }
@@ -155,11 +158,28 @@ public struct KeyEncoder: Sendable {
         case "\\": return Data([0x1C])
         case "]", "}": return Data([0x1D])
         case "^", "~": return Data([0x1E])
-        case "_": return Data([0x1F])
+        case "_", "/", "?": return Data([0x1F])
         case "@", " ": return Data([0x00])
+        case "2": return Data([0x00])
+        case "3": return Data([0x1B])
+        case "4": return Data([0x1C])
+        case "5": return Data([0x1D])
+        case "6": return Data([0x1E])
+        case "7": return Data([0x1F])
+        case "8": return Data([0x7F])
         default:
             return Data(characters.utf8)
         }
+    }
+
+    private func encodeLiteralSpecialKey(_ special: String, modifiers: KeyModifiers) -> Data? {
+        guard ["\t", "\r", "\u{1B}", "\u{7F}"].contains(special) else { return nil }
+
+        var data = Data(special.utf8)
+        if modifiers.contains(.alt) {
+            data = Data([0x1B]) + data
+        }
+        return data
     }
 
     // MARK: - Modified Special Keys
