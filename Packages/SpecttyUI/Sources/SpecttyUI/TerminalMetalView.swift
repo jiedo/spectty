@@ -1,6 +1,5 @@
 import UIKit
 import MetalKit
-import GameController
 import SpecttyTerminal
 
 private final class TerminalTextPosition: UITextPosition {
@@ -73,7 +72,7 @@ public final class TerminalMetalView: MTKView, UITextInput {
         }
         return bar
     }()
-    private var hardwareKeyboardConnected = GCKeyboard.coalesced != nil
+    private var hardwareKeyboardConnected = false
     private var pendingDisplayWorkItem: DispatchWorkItem?
     private var lastDisplayTime: CFTimeInterval = 0
 
@@ -246,15 +245,22 @@ public final class TerminalMetalView: MTKView, UITextInput {
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(hardwareKeyboardDidChange),
-            name: NSNotification.Name.GCKeyboardDidConnect,
+            name: UIResponder.keyboardWillShowNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(hardwareKeyboardDidChange),
-            name: NSNotification.Name.GCKeyboardDidDisconnect,
+            name: UIResponder.keyboardWillHideNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(hardwareKeyboardDidChange),
+            name: UIResponder.keyboardWillChangeFrameNotification,
+            object: nil
+        )
+        refreshHardwareKeyboardState(shouldReloadInputViews: false)
     }
 
     @objc private func appDidEnterBackground() {
@@ -390,10 +396,15 @@ public final class TerminalMetalView: MTKView, UITextInput {
         refreshHardwareKeyboardState()
     }
 
-    private func refreshHardwareKeyboardState() {
-        let isConnected = GCKeyboard.coalesced != nil
+    private var isHardwareKeyboardInputExpected: Bool {
+        UITextInputContext.current()?.isHardwareKeyboardInputExpected ?? false
+    }
+
+    private func refreshHardwareKeyboardState(shouldReloadInputViews: Bool = true) {
+        let isConnected = isHardwareKeyboardInputExpected
         guard hardwareKeyboardConnected != isConnected else { return }
         hardwareKeyboardConnected = isConnected
+        guard shouldReloadInputViews else { return }
         imeTextField.reloadInputViews()
         reloadInputViews()
         setNeedsLayout()
@@ -401,6 +412,7 @@ public final class TerminalMetalView: MTKView, UITextInput {
 
     @discardableResult
     public override func becomeFirstResponder() -> Bool {
+        refreshHardwareKeyboardState()
         updateIMETextFieldFrame()
         return imeTextField.becomeFirstResponder()
     }
