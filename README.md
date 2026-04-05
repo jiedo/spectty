@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
+## Documentation
+
+- Chinese project overview: [`docs/overview.md`](docs/overview.md)
+
 ## Features
 
 - **SSH & Mosh** — connect over SSH or Mosh with automatic reconnection and network roaming
